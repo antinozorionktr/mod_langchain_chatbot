@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  llama-chatbot:
+    build: .
+    ports:
+      - "8501:8501"    # Streamlit
+      - "11434:11434"  # Ollama
+    volumes:
+      - ./vector_db:/app/vector_db  # Persist vector database
+      - ollama_data:/root/.ollama   # Persist Ollama models
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - OLLAMA_HOST=0.0.0.0:11434
+    depends_on:
+      - postgres
+    networks:
+      - app-network
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: intelligence_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: your_password_here
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql  # Optional: Initialize with your schema
+    networks:
+      - app-network
+
+volumes:
+  ollama_data:
+  postgres_data:
+
+networks:
+  app-network:
+    driver: bridge
