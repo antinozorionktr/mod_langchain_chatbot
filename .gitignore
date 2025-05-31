@@ -76,3 +76,6 @@ local_settings.py
 
 # LangChain specific
 langchain.db
+
+# Vector database folder
+vector_db/
