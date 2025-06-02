@@ -570,6 +570,7 @@ class EnhancedPostgreSQLChatbot:
         """
         
         try:
+            # Option 1: Basic agent creation (most compatible)
             self.agent = create_sql_agent(
                 llm=self.llm,
                 toolkit=self.toolkit,
@@ -577,13 +578,36 @@ class EnhancedPostgreSQLChatbot:
                 agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
                 handle_parsing_errors=True,
                 max_iterations=3,
-                max_execution_time=120,
-                early_stopping_method="generate",
-                prefix=self.sql_agent_prefix
+                max_execution_time=120
+                # Remove early_stopping_method parameter
             )
+            
+            # Option 2: If you want to try with more parameters (for newer LangChain versions)
+            # self.agent = create_sql_agent(
+            #     llm=self.llm,
+            #     toolkit=self.toolkit,
+            #     verbose=True,
+            #     agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            #     handle_parsing_errors=True,
+            #     max_iterations=3,
+            #     max_execution_time=120,
+            #     early_stopping_method="force"  # Try "force" instead of "generate"
+            # )
+            
         except Exception as e:
             st.error(f"Error creating SQL agent: {e}")
-            self.agent = None
+            # Fallback to even more basic agent creation
+            try:
+                self.agent = create_sql_agent(
+                    llm=self.llm,
+                    toolkit=self.toolkit,
+                    verbose=True,
+                    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION
+                )
+                st.warning("Created SQL agent with basic configuration due to compatibility issues")
+            except Exception as e2:
+                st.error(f"Failed to create even basic SQL agent: {e2}")
+                self.agent = None
         
         # Initialize conversation history
         self.chat_history = []
