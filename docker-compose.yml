@@ -23,9 +23,9 @@ services:
   postgres:
     image: postgres:15
     environment:
-      POSTGRES_DB: intelligence_db
+      POSTGRES_DB: backup_m
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: your_password_here
+      POSTGRES_PASSWORD: '1234'
     ports:
       - "15432:5432"  # Remapped to avoid host conflicts
     volumes:

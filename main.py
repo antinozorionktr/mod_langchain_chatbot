@@ -1,4 +1,9 @@
+import re
 import os
+import shutil
+import pandas as pd
+import plotly.express as px
+import time
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -11,17 +16,20 @@ from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits.sql.base import create_sql_agent
 from langchain.agents.agent_types import AgentType
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_chroma import Chroma
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-import re
-import json
-import chromadb
 from datetime import datetime
-import hashlib
 import requests
+import httpx
+import json
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import asyncio
 
 class VectorDatabaseManager:
     """Manages vector database operations for semantic search across tables"""
@@ -30,9 +38,110 @@ class VectorDatabaseManager:
         self.embeddings = OllamaEmbeddings(model=embedding_model)
         self.persist_directory = persist_directory
         self.vectorstore = None
+        self.embedding_model = embedding_model
         
-    def create_documents_from_data(self, engine):
-        """Create documents from database tables for vector storage"""
+    def get_embedding_dimension(self):
+        """Get the dimension of the current embedding model"""
+        try:
+            # Test with a sample text to get embedding dimension
+            test_embedding = self.embeddings.embed_query("test")
+            return len(test_embedding)
+        except Exception as e:
+            st.error(f"Error getting embedding dimension: {e}")
+            return None
+    
+    def check_existing_database_compatibility(self):
+        """Check if existing database is compatible with current embeddings"""
+        if not os.path.exists(self.persist_directory):
+            return True, "No existing database found"
+        
+        try:
+            # Try to load existing database and check compatibility
+            existing_vectorstore = Chroma(
+                persist_directory=self.persist_directory,
+                embedding_function=self.embeddings
+            )
+            # Try a simple operation to test compatibility
+            existing_vectorstore.similarity_search("test", k=1)
+            return True, "Existing database is compatible"
+        except Exception as e:
+            error_str = str(e)
+            if "dimension" in error_str.lower():
+                return False, f"Dimension mismatch: {error_str}"
+            else:
+                return False, f"Compatibility issue: {error_str}"
+    
+    def backup_existing_database(self):
+        """Backup existing database before rebuilding"""
+        if os.path.exists(self.persist_directory):
+            backup_dir = f"{self.persist_directory}_backup_{int(time.time())}"
+            try:
+                shutil.copytree(self.persist_directory, backup_dir)
+                st.info(f"📦 Backed up existing database to: {backup_dir}")
+                return backup_dir
+            except Exception as e:
+                st.warning(f"Could not backup existing database: {e}")
+                return None
+        return None
+    
+    def clear_existing_database(self):
+        """Clear existing database directory"""
+        if os.path.exists(self.persist_directory):
+            try:
+                shutil.rmtree(self.persist_directory)
+                st.info("🗑️ Cleared existing incompatible database")
+                return True
+            except Exception as e:
+                st.error(f"Error clearing existing database: {e}")
+                return False
+        return True
+        
+    def get_table_row_counts(self, engine):
+        """Get row counts for each table to calculate progress"""
+        table_configs = {
+            'e_sit_rep': {
+                'description': 'Electronic Situation Reports - incident reports with location, time, and details',
+                'key_fields': ['incident_date', 'incident_type', 'incident_subtype', 'description', 'location_info']
+            },
+            'en_activity': {
+                'description': 'Enemy Activity reports - sensor-detected activities and targets',
+                'key_fields': ['sensor_type', 'tgt_type', 'activity_type', 'description', 'location_info']
+            },
+            'imint': {
+                'description': 'Imagery Intelligence reports - visual intelligence with target and activity analysis',
+                'key_fields': ['date', 'tgt_type', 'activity_type', 'incident_type', 'description', 'grading']
+            },
+            'tac_int': {
+                'description': 'Tactical Intelligence reports - field intelligence with target and activity details',
+                'key_fields': ['date', 'tgt_type', 'activity_type', 'incident_type', 'description', 'grading']
+            },
+            'ecas': {
+                'description': 'Electronic Counter Attack System data - electronic warfare activities and emitters',
+                'key_fields': ['date', 'emitter_type', 'emitter_name', 'location', 'description']
+            }
+        }
+        
+        table_counts = {}
+        total_rows = 0
+        
+        for table_name in table_configs.keys():
+            try:
+                count_query = f"""
+                SELECT COUNT(*) as count FROM {table_name} 
+                WHERE description IS NOT NULL
+                """
+                result = pd.read_sql(count_query, engine)
+                count = min(result['count'].iloc[0], 1000)  # Limit to 1000 per table
+                table_counts[table_name] = count
+                total_rows += count
+            except Exception as e:
+                st.warning(f"Could not get count for table {table_name}: {e}")
+                table_counts[table_name] = 0
+        
+        return table_counts, total_rows
+        
+    def create_documents_from_data_with_progress(self, engine):
+        """Create documents from database tables for vector storage with progress tracking"""
         documents = []
         
         # Define table mappings with their descriptions
@@ -59,8 +168,31 @@ class VectorDatabaseManager:
             }
         }
         
+        # Get table counts for progress calculation
+        table_counts, total_rows = self.get_table_row_counts(engine)
+        
+        if total_rows == 0:
+            st.error("No data found in any tables")
+            return []
+        
+        # Create progress bar and status containers
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        table_status = st.empty()
+        
+        processed_rows = 0
+        
         try:
             for table_name, config in table_configs.items():
+                table_row_count = table_counts.get(table_name, 0)
+                
+                if table_row_count == 0:
+                    continue
+                
+                # Update status
+                status_text.text(f"Processing table: {table_name} ({table_row_count} records)")
+                table_status.info(f"📊 Current table: **{table_name}** - {config['description']}")
+                
                 # Get data from each table
                 query = f"""
                 SELECT * FROM {table_name} 
@@ -72,110 +204,305 @@ class VectorDatabaseManager:
                 df = pd.read_sql(query, engine)
                 
                 if not df.empty:
-                    for _, row in df.iterrows():
-                        # Create comprehensive document content
-                        content_parts = [
-                            f"Table: {table_name}",
-                            f"Description: {config['description']}",
-                            f"Record ID: {row.get('id', 'N/A')}"
-                        ]
+                    # Process rows in batches for better progress updates
+                    batch_size = max(1, len(df) // 20)  # 20 updates per table
+                    
+                    for batch_start in range(0, len(df), batch_size):
+                        batch_end = min(batch_start + batch_size, len(df))
+                        batch_df = df.iloc[batch_start:batch_end]
                         
-                        # Add key field information
-                        for field in config['key_fields']:
-                            if field in row and pd.notna(row[field]):
-                                if field == 'location_info':
-                                    # Combine location fields
-                                    location_parts = []
-                                    for loc_field in ['lat', 'long', 'incident_state', 'location']:
-                                        if loc_field in row and pd.notna(row[loc_field]):
-                                            location_parts.append(f"{loc_field}: {row[loc_field]}")
-                                    if location_parts:
-                                        content_parts.append(f"Location: {', '.join(location_parts)}")
-                                else:
-                                    content_parts.append(f"{field}: {row[field]}")
+                        # Process batch
+                        for _, row in batch_df.iterrows():
+                            # Create comprehensive document content
+                            content_parts = [
+                                f"Table: {table_name}",
+                                f"Description: {config['description']}",
+                                f"Record ID: {row.get('id', 'N/A')}"
+                            ]
+                            
+                            # Add key field information
+                            for field in config['key_fields']:
+                                if field in row and pd.notna(row[field]):
+                                    if field == 'location_info':
+                                        # Combine location fields
+                                        location_parts = []
+                                        for loc_field in ['lat', 'long', 'incident_state', 'location']:
+                                            if loc_field in row and pd.notna(row[loc_field]):
+                                                location_parts.append(f"{loc_field}: {row[loc_field]}")
+                                        if location_parts:
+                                            content_parts.append(f"Location: {', '.join(location_parts)}")
+                                    else:
+                                        content_parts.append(f"{field}: {row[field]}")
+                            
+                            # Add organizational information
+                            org_fields = ['cmd_name', 'corps_name', 'div_name', 'bde_name', 'unit_name']
+                            org_info = []
+                            for field in org_fields:
+                                if field in row and pd.notna(row[field]):
+                                    org_info.append(f"{field}: {row[field]}")
+                            if org_info:
+                                content_parts.append(f"Organization: {', '.join(org_info)}")
+                            
+                            # Create metadata
+                            metadata = {
+                                'table': table_name,
+                                'id': str(row.get('id', '')),
+                                'type': config['description'],
+                                'date': str(row.get('date', row.get('incident_date', row.get('created_at', '')))),
+                            }
+                            
+                            # Add type information to metadata
+                            if 'incident_type' in row and pd.notna(row['incident_type']):
+                                metadata['incident_type'] = str(row['incident_type'])
+                            if 'activity_type' in row and pd.notna(row['activity_type']):
+                                metadata['activity_type'] = str(row['activity_type'])
+                            if 'tgt_type' in row and pd.notna(row['tgt_type']):
+                                metadata['target_type'] = str(row['tgt_type'])
+                            
+                            # Create document
+                            doc = Document(
+                                page_content='\n'.join(content_parts),
+                                metadata=metadata
+                            )
+                            documents.append(doc)
                         
-                        # Add organizational information
-                        org_fields = ['cmd_name', 'corps_name', 'div_name', 'bde_name', 'unit_name']
-                        org_info = []
-                        for field in org_fields:
-                            if field in row and pd.notna(row[field]):
-                                org_info.append(f"{field}: {row[field]}")
-                        if org_info:
-                            content_parts.append(f"Organization: {', '.join(org_info)}")
+                        # Update progress
+                        processed_rows += len(batch_df)
+                        progress_percentage = min(processed_rows / total_rows, 1.0)
+                        progress_bar.progress(progress_percentage)
                         
-                        # Create metadata
-                        metadata = {
-                            'table': table_name,
-                            'id': str(row.get('id', '')),
-                            'type': config['description'],
-                            'date': str(row.get('date', row.get('incident_date', row.get('created_at', '')))),
-                        }
-                        
-                        # Add type information to metadata
-                        if 'incident_type' in row and pd.notna(row['incident_type']):
-                            metadata['incident_type'] = str(row['incident_type'])
-                        if 'activity_type' in row and pd.notna(row['activity_type']):
-                            metadata['activity_type'] = str(row['activity_type'])
-                        if 'tgt_type' in row and pd.notna(row['tgt_type']):
-                            metadata['target_type'] = str(row['tgt_type'])
-                        
-                        # Create document
-                        doc = Document(
-                            page_content='\n'.join(content_parts),
-                            metadata=metadata
+                        # Update status with more details
+                        status_text.text(
+                            f"Processing {table_name}: {batch_end}/{len(df)} rows "
+                            f"({processed_rows}/{total_rows} total - {progress_percentage*100:.1f}%)"
                         )
-                        documents.append(doc)
                         
+                        # Small delay to make progress visible
+                        time.sleep(0.1)
+                
+                # Table completed
+                table_status.success(f"✅ Completed: **{table_name}** - {len([d for d in documents if d.metadata['table'] == table_name])} documents created")
+                
         except Exception as e:
-            st.error(f"Error creating documents from table {table_name}: {e}")
+            st.error(f"Error creating documents from database: {e}")
+            # Clear progress indicators on error
+            progress_bar.empty()
+            status_text.empty()
+            table_status.empty()
+            return []
+        
+        # Final status update
+        progress_bar.progress(1.0)
+        status_text.text(f"✅ Document creation completed! Created {len(documents)} documents from {len(table_configs)} tables")
+        
+        # Keep final status visible for a moment
+        time.sleep(1)
         
         return documents
     
-    def build_vector_database(self, engine):
-        """Build and persist vector database from all tables"""
+    def build_vector_database(self, engine, force_rebuild=False):
+        """Build and persist vector database from all tables with compatibility checking"""
         try:
-            st.info("Building vector database from intelligence data...")
+            st.info("🔄 Building vector database from intelligence data...")
             
-            # Create documents from database
-            documents = self.create_documents_from_data(engine)
-            
-            if not documents:
-                st.error("No documents created from database")
+            # Check embedding dimension
+            current_dimension = self.get_embedding_dimension()
+            if current_dimension is None:
+                st.error("❌ Could not determine embedding dimension")
                 return False
             
-            # Split documents if they're too large
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-            )
-            split_docs = text_splitter.split_documents(documents)
+            st.info(f"📏 Current embedding model ({self.embedding_model}) dimension: {current_dimension}")
             
-            # Create vector store
-            self.vectorstore = Chroma.from_documents(
-                documents=split_docs,
-                embedding=self.embeddings,
-                persist_directory=self.persist_directory
-            )
+            # Check existing database compatibility
+            if not force_rebuild:
+                is_compatible, compatibility_msg = self.check_existing_database_compatibility()
+                st.info(f"🔍 Compatibility check: {compatibility_msg}")
+                
+                if not is_compatible:
+                    st.warning("⚠️ Existing database is incompatible with current embedding model")
+                    
+                    # Ask user for confirmation to rebuild
+                    if not st.session_state.get('confirm_rebuild', False):
+                        st.error("❌ Cannot proceed with incompatible database. Please use the 'Force Rebuild' option.")
+                        
+                        # Show rebuild instructions
+                        st.markdown("""
+                        ### 🔧 How to fix this:
+                        
+                        **Option 1: Use the Force Rebuild button**
+                        - Click "🔄 Force Rebuild Vector Database" in the sidebar
+                        - This will backup and recreate the database with the correct dimensions
+                        
+                        **Option 2: Manually clear the database**
+                        - Delete the `./vector_db` directory
+                        - Restart the application and rebuild
+                        
+                        **Root cause:** Your database was created with a different embedding model that has different dimensions.
+                        """)
+                        return False
             
-            st.success(f"Vector database built successfully with {len(split_docs)} document chunks!")
-            return True
+            # If we reach here, either it's compatible or we're forcing rebuild
+            if force_rebuild or not self.check_existing_database_compatibility()[0]:
+                # Backup existing database
+                backup_path = self.backup_existing_database()
+                
+                # Clear existing database
+                if not self.clear_existing_database():
+                    st.error("❌ Could not clear existing database")
+                    return False
+                
+                st.success("🆕 Ready to create new vector database")
             
+            # Create main progress container
+            progress_container = st.container()
+            
+            with progress_container:
+                st.markdown("### 📊 Vector Database Creation Progress")
+                
+                # Phase 1: Document Creation
+                st.markdown("**Phase 1: Creating documents from database**")
+                documents = self.create_documents_from_data_with_progress(engine)
+                
+                if not documents:
+                    st.error("❌ No documents created from database")
+                    return False
+                
+                st.success(f"✅ Phase 1 completed: {len(documents)} documents created")
+                
+                # Phase 2: Document Splitting
+                st.markdown("**Phase 2: Splitting documents for optimal processing**")
+                split_progress = st.progress(0)
+                split_status = st.empty()
+                
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200,
+                )
+                
+                # Split documents in batches with progress
+                split_docs = []
+                batch_size = max(1, len(documents) // 10)  # 10 progress updates
+                
+                for i in range(0, len(documents), batch_size):
+                    batch_end = min(i + batch_size, len(documents))
+                    batch_docs = documents[i:batch_end]
+                    
+                    # Split batch
+                    batch_split = text_splitter.split_documents(batch_docs)
+                    split_docs.extend(batch_split)
+                    
+                    # Update progress
+                    progress = min(batch_end / len(documents), 1.0)
+                    split_progress.progress(progress)
+                    split_status.text(f"Splitting documents: {batch_end}/{len(documents)} ({progress*100:.1f}%)")
+                    
+                    time.sleep(0.1)
+                
+                st.success(f"✅ Phase 2 completed: {len(split_docs)} document chunks created")
+                
+                # Phase 3: Vector Store Creation with Progress
+                st.markdown("**Phase 3: Creating vector embeddings and database**")
+                vector_progress = st.progress(0)
+                vector_status = st.empty()
+
+                # Process documents in batches to show progress
+                batch_size = 100  # Process 100 documents at a time
+                total_batches = (len(split_docs) + batch_size - 1) // batch_size
+
+                vector_status.text(f"🔄 Creating vector store: Processing {len(split_docs)} documents in {total_batches} batches...")
+
+                # Initialize empty vector store
+                self.vectorstore = None
+
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, len(split_docs))
+                    batch_docs = split_docs[start_idx:end_idx]
+                    
+                    # Create or add to vector store
+                    if self.vectorstore is None:
+                        # Create initial vector store with first batch
+                        self.vectorstore = Chroma.from_documents(
+                            documents=batch_docs,
+                            embedding=self.embeddings,
+                            persist_directory=self.persist_directory
+                        )
+                    else:
+                        # Add subsequent batches
+                        self.vectorstore.add_documents(batch_docs)
+                    
+                    # Update progress
+                    progress = (batch_idx + 1) / total_batches
+                    vector_progress.progress(progress)
+                    vector_status.text(
+                        f"🔄 Processing batch {batch_idx + 1}/{total_batches} "
+                        f"({end_idx}/{len(split_docs)} documents - {progress*100:.1f}%)"
+                    )
+                    
+                    # Small delay to make progress visible
+                    time.sleep(0.1)
+
+                vector_progress.progress(1.0)
+                vector_status.text("✅ Vector store created successfully!")
+                
+                # Display summary statistics
+                with st.expander("📈 Database Build Summary", expanded=True):
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("Original Documents", len(documents))
+                    
+                    with col2:
+                        st.metric("Document Chunks", len(split_docs))
+                    
+                    with col3:
+                        st.metric("Tables Processed", len(set(doc.metadata['table'] for doc in documents)))
+                    
+                    with col4:
+                        st.metric("Embedding Dimension", current_dimension)
+                    
+                    # Table breakdown
+                    table_breakdown = {}
+                    for doc in documents:
+                        table = doc.metadata['table']
+                        table_breakdown[table] = table_breakdown.get(table, 0) + 1
+                    
+                    st.markdown("**Documents per table:**")
+                    for table, count in table_breakdown.items():
+                        st.write(f"- {table}: {count} documents")
+                
+                return True
+                
         except Exception as e:
-            st.error(f"Error building vector database: {e}")
+            st.error(f"❌ Error building vector database: {e}")
+            st.error("Full error details:")
+            st.code(str(e))
             return False
     
     def load_vector_database(self):
-        """Load existing vector database"""
+        """Load existing vector database with compatibility check"""
         try:
             if os.path.exists(self.persist_directory):
+                # Check compatibility first
+                is_compatible, compatibility_msg = self.check_existing_database_compatibility()
+                
+                if not is_compatible:
+                    st.warning(f"⚠️ Existing database compatibility issue: {compatibility_msg}")
+                    return False
+                
                 self.vectorstore = Chroma(
                     persist_directory=self.persist_directory,
                     embedding_function=self.embeddings
                 )
+                
+                # Verify the loaded database works
+                test_results = self.vectorstore.similarity_search("test", k=1)
+                st.success("✅ Vector database loaded and verified successfully!")
                 return True
             return False
         except Exception as e:
-            st.error(f"Error loading vector database: {e}")
+            st.error(f"❌ Error loading vector database: {e}")
+            st.warning("You may need to rebuild the vector database if it was created with a different embedding model.")
             return False
     
     def semantic_search(self, query, k=5):
@@ -286,9 +613,9 @@ class EnhancedPostgreSQLChatbot:
             st.success("Loaded existing vector database!")
             return True
     
-    def rebuild_vector_database(self):
+    def rebuild_vector_database(self, force=False):
         """Force rebuild of vector database"""
-        return self.vector_manager.build_vector_database(self.engine)
+        return self.vector_manager.build_vector_database(self.engine, force_rebuild=force)
     
     def get_related_context(self, query):
         """Get related context from vector database"""
@@ -720,14 +1047,26 @@ def main():
             else:
                 st.error("Please fill in all required fields")
         
-        # Rebuild vector database button
+        # Vector database management section
         if 'chatbot' in st.session_state:
+            st.subheader("🔍 Vector Database")
+            
+            # Regular rebuild button
             if st.button("🔄 Rebuild Vector Database"):
                 with st.spinner("Rebuilding vector database..."):
                     if st.session_state.chatbot.rebuild_vector_database():
                         st.success("Vector database rebuilt successfully!")
                     else:
                         st.error("Failed to rebuild vector database")
+            
+            # Force rebuild button (always visible when chatbot is initialized)
+            if st.button("🔄 Force Rebuild Vector Database", 
+                         help="Force rebuild even if database exists - useful for dimension mismatches"):
+                with st.spinner("Force rebuilding vector database..."):
+                    if st.session_state.chatbot.rebuild_vector_database(force=True):
+                        st.success("Vector database force rebuilt successfully!")
+                    else:
+                        st.error("Failed to force rebuild vector database")
     
     # Main interface
     if 'chatbot' in st.session_state:
