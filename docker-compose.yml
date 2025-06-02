@@ -15,29 +15,25 @@ services:
       - postgres
     networks:
       - app-network
-    develop:
-      watch:
-        - path: .
-          action: rebuild
-
+ 
   postgres:
-    image: postgres:15
+    image: postgres:17
     environment:
       POSTGRES_DB: backup_m
       POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_PASSWORD: '1234'
     ports:
-      - "15432:5432"  # Remapped to avoid host conflicts
+      - "5432:5432"  # Remapped to avoid host conflicts
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql  # Optional: Preload schema
     networks:
       - app-network
-
+ 
 volumes:
   ollama_data:
   postgres_data:
-
+ 
 networks:
   app-network:
     driver: bridge
