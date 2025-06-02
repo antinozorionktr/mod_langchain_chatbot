@@ -577,8 +577,8 @@ class EnhancedPostgreSQLChatbot:
                 verbose=True,
                 agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
                 handle_parsing_errors=True,
-                max_iterations=3,
-                max_execution_time=120
+                max_iterations=10,
+                max_execution_time=300
                 # Remove early_stopping_method parameter
             )
             
@@ -989,7 +989,7 @@ class EnhancedPostgreSQLChatbot:
 
 def main():
     st.set_page_config(
-        page_title="Local Llama Intelligence Chatbot",
+        page_title="MOD - Indian Army Chatbot",
         page_icon="🦙",
         layout="wide"
     )
